@@ -1,0 +1,1770 @@
+
+// used by the intrim bill
+
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <oraca.h>
+#include <sqlcpr.h>
+
+#include <sqlda.h>
+#include <sqlca.h>
+
+EXEC SQL DECLARE CUSTOMER_CARE DATABASE; 
+EXEC SQL DECLARE rating DATABASE; 
+
+#ifndef ORA_PROC
+	#include "db.h"
+	#include "db_data_containers.h"
+	extern int			global_invoice_no;
+	extern bill_cycle	*gsm_bill_cycle;
+	#define BILL_BLOCK_SIZE 100
+#endif
+
+
+#define BUF_LEN		50
+#define FETCH_SIZE  10
+//#define CDR_FETCH_SIZE 5000
+#define CDR_FETCH_SIZE 1000
+#define CLIENT_FETCH_SIZE 1000
+
+ 
+EXEC SQL BEGIN DECLARE SECTION;
+char *login_cust_care;
+char *login_rating;
+EXEC SQL END DECLARE SECTION;
+
+
+EXEC SQL INCLUDE sqlda;
+EXEC SQL INCLUDE sqlca;
+EXEC ORACLE OPTION (ORACA=YES);
+
+
+
+void sql_error(char *msg)
+{
+	cout << endl << msg << endl;
+	sqlca.sqlerrm.sqlerrmc[sqlca.sqlerrm.sqlerrml] = '\0';
+	oraca.orastxt.orastxtc[oraca.orastxt.orastxtl] = '\0';
+	oraca.orasfnm.orasfnmc[oraca.orasfnm.orasfnml] = '\0';
+	cout << sqlca.sqlerrm.sqlerrmc << endl;
+	cout << "in " << oraca.orastxt.orastxtc << endl;
+	cout << "on line " << oraca.oraslnr << " of " << oraca.orasfnm.orasfnmc
+		 << endl << endl;
+
+	//-- Roll back any pending changes and disconnect from Oracle.
+
+	EXEC SQL ROLLBACK RELEASE;
+	exit(1);
+}
+
+
+// Connect to ORACLE. 
+void db_connect_cust_care(char *in_login)
+{
+	login_cust_care = in_login;  // a pointer assignment, in_login has the space acclocation
+
+	EXEC SQL WHENEVER SQLERROR DO sql_error("ORACLE error--");
+//	printf("\nConnecting to ORACLE as    : %s\n", login_cust_care); 
+	printf("\nConnecting to ORACLE Cust Care\n"); 
+ 
+	EXEC SQL CONNECT :login_cust_care AT CUSTOMER_CARE;
+}
+
+
+void db_connect_rating(char *in_login)
+{
+	login_rating = in_login;  // a pointer assignment, in_login has the space acclocation
+
+	EXEC SQL WHENEVER SQLERROR DO sql_error("ORACLE error--");
+//	printf("\nConnecting to ORACLE as    : %s\n", login_rating); 
+	printf("\nConnecting to ORACLE as Rating \n"); 
+ 
+	EXEC SQL CONNECT :login_rating AT rating;
+}
+
+//-- exit with grace
+void db_disconnect_rating()
+{
+	printf("\nDisconnect from ORACLE as  : %s\n", login_rating);
+	EXEC SQL AT rating COMMIT WORK RELEASE; 
+	//exit(EXIT_SUCCESS);	
+}
+
+
+//- exit with grace
+void db_disconnect_cust_care()
+{
+	printf("\nDisconnect from ORACLE as  : %s\n", login_cust_care);
+   EXEC SQL AT CUSTOMER_CARE COMMIT WORK RELEASE; 
+
+	//exit(EXIT_SUCCESS);	
+}	
+
+
+
+
+int bill_cycle::db_pre_bill()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	char t_bill_date[50], t_pay_date[50], t_br_code[50], t_return[256], t_first[256], t_last[256];
+	int t_run_no;
+	EXEC SQL END DECLARE SECTION;
+
+	strcpy(t_br_code, bill_cycle_code.c_str());
+
+	EXEC SQL WHENEVER NOT FOUND GOTO notfound;
+
+	EXEC SQL AT CUSTOMER_CARE EXECUTE
+	begin
+ 		:t_return := bill_gen.pre_bill_run(:t_br_code, :t_bill_date, :t_run_no, :t_pay_date, :t_first, :t_last);
+	end;
+	END-EXEC;
+
+	if(strcmp(t_return, "OK"))
+	{
+		printf("<ERROR> db_pre_bill  %s\n",t_return);
+		exit(0);
+	}
+
+	bill_on_date	= t_bill_date;
+	run_no			= t_run_no;
+	pay_date		= t_pay_date;
+	first_cdr_date	= t_first;
+	last_cdr_date	= t_last;
+
+	printf("\n\n bill=%s pay=%s, first=%s, last=%s\n", t_bill_date, t_pay_date, t_first, t_last);
+
+	return 1;
+
+notfound:
+	printf("<ERROR> bill run code not found for %s \n",bill_cycle_code.c_str());
+	return 0;
+}
+
+
+
+int bill_cycle::db_post_bill(int bills)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	int t_bills;
+	char t_return[256];
+	EXEC SQL END DECLARE SECTION;
+
+	t_bills = bills;
+
+	EXEC SQL WHENEVER NOT FOUND GOTO notfound;
+
+	EXEC SQL AT CUSTOMER_CARE EXECUTE
+	begin
+ 		:t_return := bill_gen.post_bill_run(:t_bills);
+	end;
+	END-EXEC;
+
+	if(strcmp(t_return, "OK"))
+	{
+		printf("<ERROR> db_post_bill  %s\n",t_return);
+		exit(0);
+	}
+	return 1;
+
+notfound:
+//	printf("<ERROR> bill run code not found for %s \n",bill_run_code);
+	return 0;
+}
+
+
+
+void connections::db_read_cdrs()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+
+	struct cdr_t
+	{ 
+		int account_no;					// number
+		int termination_type;			// number(3)
+		int	units;						// number
+		float charge;					// number(11,2)
+		char call_partner_id[BUF_LEN];	// varchar2(20)		-> 2 char missing
+		int duration;					// number
+		char call_time[BUF_LEN];		// varchar2(14)
+		int  call_type_id;				// number(3)
+		char network_id[BUF_LEN];		// varchar2(5)
+		int  service_type_id;			// number(3)
+		int  locale_id;					// number(3)
+		char ms_location[BUF_LEN];
+		int  charged_units;
+	} *a;
+
+	char t_start_date[20], t_end_date[20];
+	int rows_to_fetch, rows_before, rows_this_time;
+
+EXEC SQL END DECLARE SECTION;
+
+	int i;
+	strcpy(t_start_date,start_date.c_str());
+	strcpy(t_end_date, end_date.c_str());
+ 
+ 	cdr_data cd;
+
+	rows_to_fetch = CDR_FETCH_SIZE;		// number of rows in each "batch"  
+	rows_before = 0;				   // previous value of sqlerrd[2]   
+	rows_this_time = CDR_FETCH_SIZE; 
+
+	if((a = new cdr_t[rows_to_fetch])==NULL)
+	{
+		cout<<" cant allocate memeory for cdr fetch"<<endl;
+		exit(0);
+	}
+
+ 
+	EXEC SQL 
+	AT rating 
+	DECLARE  c_cdr CURSOR FOR 
+	SELECT	ACCOUNT_NO,
+			TERMINATION_TYPE, 
+			UNITS, 
+			CHARGE,
+			CALL_PARTNER_ID, 
+			DURATION, 
+			CALL_TIME,
+			CALL_TYPE_ID,
+			NETWORK_ID,
+			SERVICE_TYPE_ID,
+			LOCALE_ID, 
+			MS_LOCATION,
+			CHARGED_UNITS
+//	FROM	BULK_BILL_RATED_CDR_V 
+	FROM	BULK_BILL_INTERIM_RATED_CDR_V  
+	WHERE	CALL_TIME >= :t_start_date  AND CALL_TIME <= :t_end_date||'235959'; 
+ 
+	EXEC SQL AT rating  OPEN c_cdr; 
+	EXEC SQL WHENEVER NOT FOUND CONTINUE; 
+
+	while (rows_this_time == rows_to_fetch) 
+	{ 
+		EXEC SQL AT rating FOR :rows_to_fetch FETCH c_cdr INTO :a; 		 
+
+		rows_this_time = sqlca.sqlerrd[2] - rows_before; 
+		rows_before = sqlca.sqlerrd[2]; 
+//		printf(" this=%d before=%d \n", rows_this_time, rows_before);
+		
+		if(rows_before%50000 == 0)
+		{
+			printf(" cdr=%d \n", rows_before);
+		}
+		else
+		{
+			printf(".");
+		
+		}
+
+
+		for(i=0; i<rows_this_time; i++)
+		{
+			cd.account_no		= a[i].account_no;					
+			cd.termination_type = a[i].termination_type;	
+			cd.units			= a[i].units;						
+			cd.charge			= a[i].charge;						
+			cd.call_partner_id	= a[i].call_partner_id;	
+			cd.duration			= a[i].duration;					
+			cd.call_time		= a[i].call_time;		
+			cd.call_type_id		= a[i].call_type_id;		
+			cd.network_id		= a[i].network_id; 
+			cd.rate_rule_id		= ""; //-- for telephony		
+			cd.service_type_id	= a[i].service_type_id;	
+			cd.locale_id		= a[i].locale_id;
+			cd.ms_location		= a[i].ms_location;
+			cd.charged_units	= a[i].charged_units;
+									
+			if(set_current(cd.account_no))
+			{
+				current->call.classify_calls(&cd);
+				//-- if eligible to bulk discount then add to call list
+				if(current->connection.bulk_discount==true)
+				{
+					current->blk_discount.insert_cdr(&cd);
+				}
+			}
+		}
+	} 
+
+	EXEC SQL AT rating CLOSE c_cdr; 
+	delete a;
+	printf("%d  cdrs read.\n\n",rows_before);
+}
+
+
+void connections::db_read_gprs()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+
+	struct gprs_t
+	{
+		int		account_no;
+		float	charge;
+	} *b;
+	char t_start_date[20], t_end_date[20];
+	int rows_to_fetch, rows_before, rows_this_time; 
+
+EXEC SQL END DECLARE SECTION;
+
+	int i;
+	strcpy(t_start_date,start_date.c_str());
+	strcpy(t_end_date, end_date.c_str());
+
+	rows_to_fetch = CDR_FETCH_SIZE;		// number of rows in each "batch"  
+	rows_before = 0;					// previous value of sqlerrd[2]   
+	rows_this_time = CDR_FETCH_SIZE; 
+
+	if((b = new gprs_t[rows_to_fetch])==NULL)
+	{
+		cout<<" cant allocate memory for gprs fetch"<<endl;
+		exit(0);
+	}
+
+
+	EXEC SQL 
+	AT CUSTOMER_CARE 
+	DECLARE c_gprs CURSOR FOR 
+	SELECT	ACCOUNT_NO,
+			CHARGE  
+	FROM	bill_fast_gprs_cdrs_v
+	WHERE	CALL_TIME >= :t_start_date  AND CALL_TIME <= :t_end_date ||'235959'; 
+
+	EXEC SQL AT CUSTOMER_CARE OPEN c_gprs;
+
+	EXEC SQL WHENEVER NOT FOUND CONTINUE; 
+
+	while (rows_this_time == rows_to_fetch) 
+	{ 
+		EXEC SQL AT CUSTOMER_CARE FOR :rows_to_fetch FETCH c_gprs INTO :b; 
+				 
+		rows_this_time = sqlca.sqlerrd[2] - rows_before; 
+		rows_before = sqlca.sqlerrd[2]; 
+//		printf(" this=%d before=%d \n", rows_this_time, rows_before);
+
+		for(i=0; i<rows_this_time; i++)
+		{
+			if(set_current(b[i].account_no))
+			{
+				current->call.gprs += b[i].charge;
+			}
+		}
+	}
+
+	EXEC SQL AT CUSTOMER_CARE CLOSE c_gprs; 
+	delete b;
+
+	printf("%d gprs records loaded.\n\n",rows_before);
+}
+
+
+//-- tap file records
+void connections::db_read_tap()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+
+	struct tap_t
+	{
+		int		account_no;
+		float	charge;
+	} *b;
+	char t_start_date[20], t_end_date[20];
+	int rows_to_fetch, rows_before, rows_this_time; 
+
+EXEC SQL END DECLARE SECTION;
+
+	int i;
+	strcpy(t_start_date,start_date.c_str());
+	strcpy(t_end_date, end_date.c_str());
+
+	rows_to_fetch = CDR_FETCH_SIZE;		// number of rows in each "batch"  
+	rows_before = 0;				// previous value of sqlerrd[2]   
+	rows_this_time = CDR_FETCH_SIZE; 
+
+	if((b = new tap_t[rows_to_fetch])==NULL)
+	{
+		cout<<" cant allocate memory for tap fetch"<<endl;
+		exit(0);
+	}
+
+
+	EXEC SQL 
+	AT CUSTOMER_CARE 
+	DECLARE c_tap CURSOR FOR 
+	SELECT	ACCOUNT_NO,
+			CHARGE  
+	FROM	bill_fast_tap_cdrs_v
+	WHERE	RATED_TIME >= :t_start_date  AND RATED_TIME <= :t_end_date ||'235959'; 
+
+	EXEC SQL AT CUSTOMER_CARE OPEN c_tap;
+
+	EXEC SQL WHENEVER NOT FOUND CONTINUE; 
+
+	while (rows_this_time == rows_to_fetch) 
+	{ 
+		EXEC SQL AT CUSTOMER_CARE FOR :rows_to_fetch FETCH c_tap INTO :b; 
+				 
+		rows_this_time = sqlca.sqlerrd[2] - rows_before; 
+		rows_before = sqlca.sqlerrd[2]; 
+//		printf(" this=%d before=%d \n", rows_this_time, rows_before);
+		printf(" tap=%d \n", rows_before);
+
+		for(i=0; i<rows_this_time; i++)
+		{
+			if(set_current(b[i].account_no))
+			{
+				current->call.air += b[i].charge;
+			}
+		}
+	}
+
+	EXEC SQL AT CUSTOMER_CARE CLOSE c_tap; 
+	delete b;
+
+	printf("%d tap records loaded.\n\n",rows_before);
+}
+
+
+//-- evolution charges
+void connections::db_read_anyware()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+
+	struct anyware
+	{
+		int		account_no;					//-- NUMBER(10)    NOT NULL, 
+		float	charge;						//-- NUMBER(7,2)   NOT NULL, 
+	} *b;
+
+	char t_start_date[20], t_end_date[20];
+	int rows_to_fetch, rows_before, rows_this_time; 
+
+EXEC SQL END DECLARE SECTION;
+
+	int i;
+	strcpy(t_start_date,start_date.c_str());
+	strcpy(t_end_date, end_date.c_str());
+	cdr_data cd;
+
+	rows_to_fetch = CDR_FETCH_SIZE;		// number of rows in each "batch"  
+	rows_before = 0;				// previous value of sqlerrd[2]   
+	rows_this_time = CDR_FETCH_SIZE; 
+
+	if((b = new anyware[rows_to_fetch])==NULL)
+	{
+		cout<<" cant allocate memory for anyware fetch"<<endl;
+		exit(0);
+	}
+
+
+	EXEC SQL 
+	AT CUSTOMER_CARE 
+	DECLARE c_anyware CURSOR FOR 
+	SELECT	ACCOUNT_NO,
+			CHARGE 
+	FROM	bill_fast_anyware_charges_v
+	WHERE	CALL_TIME >= :t_start_date  AND CALL_TIME <= :t_end_date ||'235959'; 
+
+	EXEC SQL AT CUSTOMER_CARE OPEN c_anyware;
+
+	EXEC SQL WHENEVER NOT FOUND CONTINUE; 
+
+	while (rows_this_time == rows_to_fetch) 
+	{ 
+		EXEC SQL AT CUSTOMER_CARE FOR :rows_to_fetch FETCH c_anyware INTO :b; 
+				 
+		rows_this_time = sqlca.sqlerrd[2] - rows_before; 
+		rows_before = sqlca.sqlerrd[2]; 
+//		printf(" this=%d before=%d \n", rows_this_time, rows_before);
+		printf(" anyware=%d \n", rows_before);
+
+		for(i=0; i<rows_this_time; i++)
+		{
+			if(set_current(b[i].account_no))
+				current->call.anyware += b[i].charge;
+		}
+	}
+
+	EXEC SQL AT CUSTOMER_CARE CLOSE c_anyware; 
+	delete b;
+
+	printf("%d anyware records loaded.\n\n",rows_before);
+}
+
+
+//-- connections
+void connections::db_read_connections()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+
+	struct connection
+	{ 
+		int		account_no;
+		char	package_code[BUF_LEN];
+		float	contract_charge;	
+		char	contract_end_date[BUF_LEN];
+		char	tax_group[BUF_LEN]; 
+		char    corporate_bill_code[BUF_LEN];
+		char	value_plus_plus[20];
+		char	connection_status[10];
+	} *a; 
+	int i;
+
+	int rows_to_fetch, rows_before, rows_this_time;
+	char t_start_date[20],t_end_date[20];
+	EXEC SQL END DECLARE SECTION;
+
+	strcpy(t_start_date,start_date.c_str());
+	strcpy(t_end_date, end_date.c_str());
+
+	rows_to_fetch = CLIENT_FETCH_SIZE;		// number of rows in each "batch"  
+	rows_before = 0;				   // previous value of sqlerrd[2]   
+	rows_this_time = CLIENT_FETCH_SIZE; 
+
+	if((a = new connection[rows_to_fetch])==NULL)
+	{
+		cout<<" cant allocate memeory for connections fetch"<<endl;
+		exit(0);
+	}
+
+	EXEC SQL 
+	AT CUSTOMER_CARE  
+	DECLARE c_connection CURSOR FOR 
+	SELECT	ACCOUNT_NO, 
+			PACKAGE_CODE,
+			CONTRACT_CHARGE, 
+			CONTRACT_END_DATE, 
+			TAX_GROUP,
+			CORPORATE_BILL_CODE, 
+			VALUE_PLUS_PLUS,
+			CONNECTION_STATUS
+//	FROM	BILL_FAST_CONNECTIONS_V 
+//	WHERE	COMMENCEMENT_DATE <= :t_end_date AND
+//			NOT 
+//			  (
+//				CONNECTION_STATUS = 'D' AND 
+//				TRUNC(CURRENT_STATUS_DATE) < :t_start_date
+//			  );
+	FROM	BILL_INTERIM_CONNECTIONS_V 
+	WHERE	NOT 
+			(CONNECTION_STATUS = 'D' AND 
+			NVL(DISCONNECTED_DATE, TO_DATE('20100101','YYYYMMDD')) < TO_DATE(:t_start_date, 'YYYYMMDD'));
+
+
+//-- don't load any disconnected connections older than current bill cycles
+	   
+	EXEC SQL AT CUSTOMER_CARE OPEN c_connection; 
+ 
+	EXEC SQL WHENEVER NOT FOUND CONTINUE; 
+
+	connection_detail c_d;
+
+	while (rows_this_time == rows_to_fetch) 
+	{ 
+		EXEC SQL AT CUSTOMER_CARE FOR :rows_to_fetch FETCH c_connection INTO :a; 		 
+
+		rows_this_time = sqlca.sqlerrd[2] - rows_before; 
+		rows_before = sqlca.sqlerrd[2]; 
+//		printf(" this=%d before=%d \n", rows_this_time, rows_before);
+		printf(" connections=%d \n", rows_before);
+
+		for(i=0; i<rows_this_time; i++)
+		{
+			c_d.account_no			=   a[i].account_no;
+			c_d.package_code		=	a[i].package_code; 
+			c_d.contract_charge 	=	a[i].contract_charge*100;
+			c_d.contract_end_date	=	a[i].contract_end_date;
+			c_d.tax_group			=	a[i].tax_group;
+			c_d.corporate_bill_code =	a[i].corporate_bill_code;
+			c_d.value_plus_plus		=	a[i].value_plus_plus;
+			c_d.connection_status   =	a[i].connection_status;
+			insert(a[i].account_no, c_d); 
+		}
+	} 
+
+	EXEC SQL AT CUSTOMER_CARE CLOSE c_connection; 
+ 	delete a;
+
+	printf("\n %d loaded connections \n\n",rows_before);
+}
+
+
+void connections::db_read_package_rental()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+		struct package_rental
+		{ 
+			int		account_no;
+			float	rental;	
+		} *a; 
+		int i;
+		int rows_to_fetch, rows_before, rows_this_time;
+	EXEC SQL END DECLARE SECTION;
+
+	rows_to_fetch = CLIENT_FETCH_SIZE;
+	rows_before = 0;				
+	rows_this_time = CLIENT_FETCH_SIZE; 
+
+	if((a = new package_rental[rows_to_fetch])==NULL)
+	{
+		cout<<" cant allocate memory for package rental fetch"<<endl;
+		exit(0);
+	}
+
+	EXEC SQL 
+	AT CUSTOMER_CARE  
+	DECLARE c_package_rental CURSOR FOR 
+	SELECT	ACCOUNT_NO, 
+			RENTAL
+	FROM	bill_fast_package_rental_v;
+	   
+	EXEC SQL AT CUSTOMER_CARE OPEN c_package_rental; 
+ 	EXEC SQL WHENEVER NOT FOUND CONTINUE; 
+
+	while (rows_this_time == rows_to_fetch) 
+	{ 
+		EXEC SQL AT CUSTOMER_CARE FOR :rows_to_fetch FETCH c_package_rental INTO :a; 		 
+
+		rows_this_time = sqlca.sqlerrd[2] - rows_before; 
+		rows_before = sqlca.sqlerrd[2]; 
+		printf(" this=%d before=%d \n", rows_this_time, rows_before);
+
+		for(i=0; i<rows_this_time; i++)
+		{
+			if(set_current(a[i].account_no))
+			{
+				current->charge.total_monthly_rental += a[i].rental;
+				current->charge.package_rental += a[i].rental;
+			}
+		}
+	} 
+
+	EXEC SQL AT CUSTOMER_CARE CLOSE c_package_rental; 
+ 	delete a;
+
+	printf("\n %d loaded package rentals \n\n",rows_before);
+}
+
+
+//-- vas, clip, sms
+void connections::db_read_value_add_rental()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+		struct value_add_rental
+		{ 
+			int		account_no;
+			float	rental;	
+			char	rent_code[50];
+		} *a; 
+		int i;
+		int rows_to_fetch, rows_before, rows_this_time;
+		char t_start_date[20], t_end_date[20];
+	EXEC SQL END DECLARE SECTION;
+
+	strcpy(t_start_date,start_date.c_str());
+	strcpy(t_end_date, end_date.c_str());
+
+	rows_to_fetch = CLIENT_FETCH_SIZE;		// number of rows in each "batch"  
+	rows_before = 0;						// previous value of sqlerrd[2]   
+	rows_this_time = CLIENT_FETCH_SIZE; 
+
+	if((a = new value_add_rental[rows_to_fetch])==NULL)
+	{
+		cout<<" cant allocate memory for value add rental fetch"<<endl;
+		exit(0);
+	}
+
+	EXEC SQL 
+	AT CUSTOMER_CARE  
+	DECLARE c_value_add_rental CURSOR FOR 
+	SELECT	ACCOUNT_NO, 
+			RENTAL,
+			SERVICE_CODE||'_RENT'
+	FROM	bill_fast_value_add_rental_v 
+	WHERE	(  
+				RENTAL_ACTIVATION_DATE < to_date(:t_end_date, 'YYYYMMDD') 
+				OR 
+				TRUNC(RENTAL_ACTIVATION_DATE) BETWEEN 
+				to_date(:t_start_date,'YYYYMMDD') AND to_date(:t_end_date, 'YYYYMMDD') 
+			);
+	   
+	EXEC SQL AT CUSTOMER_CARE OPEN c_value_add_rental; 
+ 
+	EXEC SQL WHENEVER NOT FOUND CONTINUE; 
+
+	while (rows_this_time == rows_to_fetch) 
+	{ 
+		EXEC SQL AT CUSTOMER_CARE FOR :rows_to_fetch FETCH c_value_add_rental INTO :a; 		 
+
+		rows_this_time = sqlca.sqlerrd[2] - rows_before; 
+		rows_before = sqlca.sqlerrd[2]; 
+//		printf(" this=%d before=%d \n", rows_this_time, rows_before);
+		printf(" vas=%d \n", rows_before);
+
+		for(i=0; i<rows_this_time; i++)
+		{
+			if(set_current(a[i].account_no))
+			{
+				current->charge.total_monthly_rental += a[i].rental;
+				current->charge.rent_breakup[a[i].rent_code]=a[i].rental;
+			}
+		}
+	} 
+
+	EXEC SQL AT CUSTOMER_CARE CLOSE c_value_add_rental; 
+ 	delete a;
+
+	printf("\n %d loaded value add rentals \n\n",rows_before);
+}
+
+// -- payments
+void connections::db_read_payments()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+		struct payments
+		{ 
+			int		account_no;
+			float	payment;
+			float	balance_bf;	
+		} *a; 
+		int i;
+		int rows_to_fetch, rows_before, rows_this_time;
+	EXEC SQL END DECLARE SECTION;
+
+	rows_to_fetch = CLIENT_FETCH_SIZE;		// number of rows in each "batch"  
+	rows_before = 0;						// previous value of sqlerrd[2]   
+	rows_this_time = CLIENT_FETCH_SIZE; 
+
+	if((a = new payments[rows_to_fetch])==NULL)
+	{
+		cout<<" cant allocate memory for payment fetch"<<endl;
+		exit(0);
+	}
+
+	EXEC SQL 
+	AT CUSTOMER_CARE  
+	DECLARE c_payments CURSOR FOR 
+	SELECT	ACCOUNT_NO, 
+			PAYMENT,
+			BALANCE_BF
+//	FROM	bill_fast_payments_v;
+	FROM	bill_interim_payments_v;
+	   
+	EXEC SQL AT CUSTOMER_CARE OPEN c_payments; 
+ 
+	EXEC SQL WHENEVER NOT FOUND CONTINUE; 
+
+	while (rows_this_time == rows_to_fetch) 
+	{ 
+		EXEC SQL AT CUSTOMER_CARE FOR :rows_to_fetch FETCH c_payments INTO :a; 		 
+
+		rows_this_time = sqlca.sqlerrd[2] - rows_before; 
+		rows_before = sqlca.sqlerrd[2]; 
+//		printf(" this=%d before=%d \n", rows_this_time, rows_before);
+		printf(" payments=%d \n", rows_before);
+
+		for(i=0; i<rows_this_time; i++)
+		{
+			if(set_current(a[i].account_no))
+			{
+				current->charge.payments += a[i].payment;
+				current->charge.brought_forward += a[i].balance_bf;
+			}
+		}
+	} 
+
+	EXEC SQL AT CUSTOMER_CARE CLOSE c_payments; 
+ 	delete a;
+
+	printf("\n %d loaded payments \n\n",rows_before);
+}
+
+void connections::db_read_interest()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+		struct s_interest
+		{ 
+			int		account_no;
+			float	interest;
+		} *a; 
+		int i;
+		char t_start_date[20], t_end_date[20];
+		int rows_to_fetch, rows_before, rows_this_time;
+	EXEC SQL END DECLARE SECTION;
+
+	strcpy(t_start_date,start_date.c_str());
+	strcpy(t_end_date, end_date.c_str());
+
+
+	rows_to_fetch = CLIENT_FETCH_SIZE;		// number of rows in each "batch"  
+	rows_before = 0;						// previous value of sqlerrd[2]   
+	rows_this_time = CLIENT_FETCH_SIZE; 
+
+	if((a = new s_interest[rows_to_fetch])==NULL)
+	{
+		cout<<" cant allocate memory for interest fetch"<<endl;
+		exit(0);
+	}
+
+	EXEC SQL 
+	AT CUSTOMER_CARE  
+	DECLARE c_interest CURSOR FOR 
+	SELECT	ACCOUNT_NO, 
+			INTEREST
+	FROM	bill_fast_interest_v 
+	WHERE	INTEREST_DATE between 
+			to_date(:t_start_date,'YYYYMMDD') AND to_date(:t_end_date, 'YYYYMMDD');
+	   
+	EXEC SQL AT CUSTOMER_CARE OPEN c_interest; 
+ 
+	EXEC SQL WHENEVER NOT FOUND CONTINUE; 
+
+	while (rows_this_time == rows_to_fetch) 
+	{ 
+		EXEC SQL AT CUSTOMER_CARE FOR :rows_to_fetch FETCH c_interest INTO :a; 		 
+
+		rows_this_time = sqlca.sqlerrd[2] - rows_before; 
+		rows_before = sqlca.sqlerrd[2]; 
+//		printf(" this=%d before=%d \n", rows_this_time, rows_before);
+
+		for(i=0; i<rows_this_time; i++)
+		{
+			if(set_current(a[i].account_no))
+			{
+				current->charge.interest += a[i].interest;
+			}
+		}
+	} 
+
+	EXEC SQL AT CUSTOMER_CARE CLOSE c_interest; 
+ 	delete a;
+
+	printf("\n %d loaded interest \n\n",rows_before);
+}
+
+
+void connections::db_read_bulk_discount_get_balance()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+		struct s_b_discount
+		{ 
+			int		account_no;
+			char	time_band[10+1];
+			char	call_type_id[10+1];
+			float	balance;
+		} *a; 
+		int i;
+		int rows_to_fetch, rows_before, rows_this_time;
+	EXEC SQL END DECLARE SECTION;
+
+
+	rows_to_fetch = CLIENT_FETCH_SIZE;		// number of rows in each "batch"  
+	rows_before = 0;						// previous value of sqlerrd[2]   
+	rows_this_time = CLIENT_FETCH_SIZE; 
+
+	if((a = new s_b_discount[rows_to_fetch])==NULL)
+	{
+		cout<<" cant allocate memory for bulk discount balance fetch"<<endl;
+		exit(0);
+	}
+
+	EXEC SQL 
+	AT CUSTOMER_CARE  
+	DECLARE c_bulk_discount CURSOR FOR 
+	SELECT	ACCOUNT_NO, 
+			TIME_BAND,
+			CALL_TYPE_ID,
+			BALANCE
+	FROM	bd_minute_balance; 
+	   
+	EXEC SQL AT CUSTOMER_CARE OPEN c_bulk_discount; 
+ 
+	EXEC SQL WHENEVER NOT FOUND CONTINUE; 
+
+	while (rows_this_time == rows_to_fetch) 
+	{ 
+		EXEC SQL AT CUSTOMER_CARE FOR :rows_to_fetch FETCH c_bulk_discount INTO :a; 		 
+
+		rows_this_time = sqlca.sqlerrd[2] - rows_before; 
+		rows_before = sqlca.sqlerrd[2]; 
+//		printf(" this=%d before=%d \n", rows_this_time, rows_before);
+
+		for(i=0; i<rows_this_time; i++)
+		{
+			if(set_current(a[i].account_no))
+			{
+				current->blk_discount.insert_balance(a[i].time_band, 
+				a[i].call_type_id, a[i].balance);
+			}
+//			cout<<" Bulk min "<<a[i].account_no<<endl;
+		}
+	} 
+
+	EXEC SQL AT CUSTOMER_CARE CLOSE c_bulk_discount; 
+ 	delete a;
+
+	printf("\n %d loaded bulk min balance \n\n",rows_before);
+}
+
+
+
+void connections::db_insert_bulk_discount_usage()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	char t_call_type[50], t_time_band[50], t_client_code[50], t_date[50];
+	int t_ac_no;
+	float t_used;
+	EXEC SQL END DECLARE SECTION;
+
+
+	EXEC SQL WHENEVER NOT FOUND GOTO notfound;
+
+	bulk_min_balance b;
+	connection_state *c;
+	strcpy(t_date, end_date.c_str());
+
+	CONNECTION_DEF::iterator i;
+	for(i=conn.begin(); i!=conn.end(); i++)
+	{
+		c= &(*i).second;
+		if( c->connection.bulk_discount==false)
+			continue;
+
+		BULK_CREDITS_DEF::iterator j;
+		for(j=c->blk_discount.min_balance.begin(); j!=c->blk_discount.min_balance.end(); j++)
+		{
+
+			b=(*j);
+
+			if (b.used == 0)
+				continue;
+	
+			if (b.time_band==PEAK) strcpy(t_time_band, "PK");
+			else if (b.time_band==OFF_PEAK) strcpy(t_time_band,"OPK");
+			else strcpy(t_time_band,"ANY");
+
+			if (b.call_type_id==TERMINATING_CALL_RADIO) strcpy(t_call_type, "IN");
+			else if (b.call_type_id==ORIGINATING_CALL_RADIO) strcpy(t_call_type,"OUT");
+			else strcpy(t_call_type,"ANY");
+
+			t_used = -b.used;
+			t_ac_no = (*i).first;
+
+			sprintf(t_client_code,"%d",t_ac_no);
+
+			EXEC SQL AT CUSTOMER_CARE EXECUTE
+			begin
+				insert into bd_trx_raw(time_band, call_type, minutes, account_no, client_code, trx_type, trx_date) 
+				values (:t_time_band,:t_call_type,:t_used, :t_ac_no, :t_client_code, 'USED',to_date(:t_date,'YYYYMMDD')); 		
+			end;
+			END-EXEC;
+//			cout<<" USED BALANCE "<<t_ac_no<<","<<t_used<<","<<t_time_band<<","<<t_call_type<<endl;
+		 }
+	}
+	return;
+notfound:
+	printf("<ERROR> cant insert bulk minute balnce \n");
+	return;
+}
+
+void connections::db_read_adjustments()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+		struct s_adjust
+		{ 
+			int		account_no;
+			float	adjustment;
+		} *a; 
+		int i;
+		int rows_to_fetch, rows_before, rows_this_time;
+		char t_start_date[20], t_end_date[20];
+	EXEC SQL END DECLARE SECTION;
+
+	strcpy(t_start_date,start_date.c_str());
+	strcpy(t_end_date, end_date.c_str());
+
+	rows_to_fetch = CLIENT_FETCH_SIZE;		// number of rows in each "batch"  
+	rows_before = 0;						// previous value of sqlerrd[2]   
+	rows_this_time = CLIENT_FETCH_SIZE; 
+
+	if((a = new s_adjust[rows_to_fetch])==NULL)
+	{
+		cout<<" cant allocate memory for adjustment fetch"<<endl;
+		exit(0);
+	}
+
+
+	EXEC SQL 
+	AT CUSTOMER_CARE  
+	DECLARE c_adjust CURSOR FOR 
+	SELECT	ACCOUNT_NO, 
+			ADJUSTMENT
+	FROM	bill_fast_account_adj_v 
+	WHERE	TRUNC(APPROVED_DATE)  BETWEEN 
+			to_date(:t_start_date,'YYYYMMDD') AND to_date(:t_end_date,'YYYYMMDD');
+	   
+	EXEC SQL AT CUSTOMER_CARE OPEN c_adjust; 
+ 
+	EXEC SQL WHENEVER NOT FOUND CONTINUE; 
+
+	while (rows_this_time == rows_to_fetch) 
+	{ 
+		EXEC SQL AT CUSTOMER_CARE FOR :rows_to_fetch FETCH c_adjust INTO :a; 		 
+
+		rows_this_time = sqlca.sqlerrd[2] - rows_before; 
+		rows_before = sqlca.sqlerrd[2]; 
+//		printf(" this=%d before=%d \n", rows_this_time, rows_before);
+
+		for(i=0; i<rows_this_time; i++)
+		{
+			if(set_current(a[i].account_no))
+			{
+				current->charge.misc_charges += a[i].adjustment;
+			}
+		}
+	} 
+
+	EXEC SQL AT CUSTOMER_CARE CLOSE c_adjust; 
+ 	delete a;
+
+	printf("\n %d loaded adjustments \n\n",rows_before);
+}
+
+
+void connections::db_read_pro_rates()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+		struct s_pro_rate
+		{ 
+			int		account_no;
+			float	pro_rate;
+		} *a; 
+		int i;
+		int rows_to_fetch, rows_before, rows_this_time;
+		char t_start_date[20], t_end_date[20];
+	EXEC SQL END DECLARE SECTION;
+
+	strcpy(t_start_date,start_date.c_str());
+	strcpy(t_end_date, end_date.c_str());
+
+	rows_to_fetch = CLIENT_FETCH_SIZE;		// number of rows in each "batch"  
+	rows_before = 0;						// previous value of sqlerrd[2]   
+	rows_this_time = CLIENT_FETCH_SIZE; 
+
+	if((a = new s_pro_rate[rows_to_fetch])==NULL)
+	{
+		cout<<" cant allocate memory for pro_rate fetch"<<endl;
+		exit(0);
+	}
+
+
+	EXEC SQL 
+	AT CUSTOMER_CARE  
+	DECLARE c_pro_rate CURSOR FOR 
+	SELECT	ACCOUNT_NO, 
+			pro_rate
+	FROM	bill_fast_pro_rate_v 
+	WHERE	TRUNC(APPROVED_DATE)  BETWEEN 
+			to_date(:t_start_date,'YYYYMMDD') AND to_date(:t_end_date,'YYYYMMDD');
+	   
+	EXEC SQL AT CUSTOMER_CARE OPEN c_pro_rate; 
+ 
+	EXEC SQL WHENEVER NOT FOUND CONTINUE; 
+
+	while (rows_this_time == rows_to_fetch) 
+	{ 
+		EXEC SQL AT CUSTOMER_CARE FOR :rows_to_fetch FETCH c_pro_rate INTO :a; 		 
+
+		rows_this_time = sqlca.sqlerrd[2] - rows_before; 
+		rows_before = sqlca.sqlerrd[2]; 
+//		printf(" this=%d before=%d \n", rows_this_time, rows_before);
+
+		for(i=0; i<rows_this_time; i++)
+		{
+			if(set_current(a[i].account_no))
+			{
+				current->charge.rental_pro_rate += a[i].pro_rate;
+			}
+		}
+	} 
+
+	EXEC SQL AT CUSTOMER_CARE CLOSE c_pro_rate; 
+ 	delete a;
+
+	printf("\n %d loaded pro_rates \n\n",rows_before);
+}
+
+
+
+//-- when a contract is first made then pro rate it during the first month
+//-- update the contrat charge with the prorated amount to achive result
+void connections::db_read_contract_charge_pro_rate()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+		struct s_pro_rate
+		{ 
+			int		account_no;
+			float	pro_rate;
+		} *a; 
+		int i;
+		int rows_to_fetch, rows_before, rows_this_time;
+		char t_start_date[20], t_end_date[20];
+	EXEC SQL END DECLARE SECTION;
+
+	strcpy(t_start_date,start_date.c_str());
+	strcpy(t_end_date, end_date.c_str());
+
+	rows_to_fetch = CLIENT_FETCH_SIZE;		// number of rows in each "batch"  
+	rows_before = 0;						// previous value of sqlerrd[2]   
+	rows_this_time = CLIENT_FETCH_SIZE; 
+
+	if((a = new s_pro_rate[rows_to_fetch])==NULL)
+	{
+		cout<<" cant allocate memory for contract charge pro_rate fetch"<<endl;
+		exit(0);
+	}
+
+
+	EXEC SQL 
+	AT CUSTOMER_CARE  
+	DECLARE c_cont_pro_rate CURSOR FOR 
+	SELECT	ACCOUNT_NO, 
+			pro_rate*100
+	FROM	bill_fast_contract_pro_rate_v
+	WHERE	START_DATE  BETWEEN 
+			:t_start_date AND :t_end_date;
+	   
+	EXEC SQL AT CUSTOMER_CARE OPEN c_cont_pro_rate; 
+ 
+	EXEC SQL WHENEVER NOT FOUND CONTINUE; 
+
+	while (rows_this_time == rows_to_fetch) 
+	{ 
+		EXEC SQL AT CUSTOMER_CARE FOR :rows_to_fetch FETCH c_cont_pro_rate INTO :a; 		 
+
+		rows_this_time = sqlca.sqlerrd[2] - rows_before; 
+		rows_before = sqlca.sqlerrd[2]; 
+//		printf(" this=%d before=%d \n", rows_this_time, rows_before);
+
+		for(i=0; i<rows_this_time; i++)
+		{
+			if(set_current(a[i].account_no))
+			{
+				current->connection.contract_charge = a[i].pro_rate;
+			}
+		}
+	} 
+
+	EXEC SQL AT CUSTOMER_CARE CLOSE c_cont_pro_rate; 
+ 	delete a;
+
+	printf("\n %d loaded contract charge pro rates \n\n",rows_before);
+}
+
+
+// -- value_plus plus
+void connections::db_read_value_pp()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+		struct s_vpp
+		{ 
+			int		account_no;
+		} *a; 
+		int i;
+		int rows_to_fetch, rows_before, rows_this_time;
+		char t_start_date[20], t_end_date[20];
+	EXEC SQL END DECLARE SECTION;
+
+	strcpy(t_start_date,start_date.c_str());
+	strcpy(t_end_date, end_date.c_str());
+
+	rows_to_fetch = CLIENT_FETCH_SIZE;		// number of rows in each "batch"  
+	rows_before = 0;						// previous value of sqlerrd[2]   
+	rows_this_time = CLIENT_FETCH_SIZE; 
+
+	if((a = new s_vpp[rows_to_fetch])==NULL)
+	{
+		cout<<" cant allocate memory for value plus plus fetch"<<endl;
+		exit(0);
+	}
+
+
+	EXEC SQL 
+	AT CUSTOMER_CARE  
+	DECLARE c_vpp_paid CURSOR FOR 
+	SELECT	ACCOUNT_NO
+	FROM	bill_fast_value_plus_paid_v 
+	WHERE	TRUNC(bill_date)  BETWEEN 
+			to_date(:t_start_date,'YYYYMMDD') AND to_date(:t_end_date,'YYYYMMDD');
+ 
+	EXEC SQL AT CUSTOMER_CARE OPEN c_vpp_paid; 
+ 
+	EXEC SQL WHENEVER NOT FOUND CONTINUE; 
+
+	while (rows_this_time == rows_to_fetch) 
+	{ 
+		EXEC SQL AT CUSTOMER_CARE FOR :rows_to_fetch FETCH c_vpp_paid INTO :a; 		 
+
+		rows_this_time = sqlca.sqlerrd[2] - rows_before; 
+		rows_before = sqlca.sqlerrd[2]; 
+//		printf(" this=%d before=%d \n", rows_this_time, rows_before);
+
+		for(i=0; i<rows_this_time; i++)
+		{
+			if(set_current(a[i].account_no))
+			{
+				current->charge.vpp_payment = true;
+			}
+		}
+	} 
+
+	EXEC SQL AT CUSTOMER_CARE CLOSE c_vpp_paid; 
+ 	delete a;
+
+	printf("\n %d loaded value plus plus \n\n",rows_before);
+}
+
+
+void holiday_day_types::db_read()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	struct holiday_day_type
+	{ 
+		char	holiday_date[BUF_LEN]; 
+		char	day_id[BUF_LEN];
+	} a, *hdtp; 
+	int i;
+	EXEC SQL END DECLARE SECTION;
+
+	hdtp=&a;
+
+	EXEC SQL AT CUSTOMER_CARE DECLARE c_holiday_day_type CURSOR FOR 
+	SELECT HOLIDAY_DATE, DAY_ID
+	FROM R_HOLIDAYS_V; 
+
+	EXEC SQL AT CUSTOMER_CARE OPEN c_holiday_day_type; 
+
+	EXEC SQL WHENEVER NOT FOUND DO break; 
+
+
+	for (i=0; ;i++) 
+	{ 
+		EXEC SQL AT CUSTOMER_CARE FETCH c_holiday_day_type INTO :hdtp; 
+		insert(atoi(hdtp->holiday_date), hdtp->day_id);
+	} 
+
+	EXEC SQL AT CUSTOMER_CARE CLOSE c_holiday_day_type; 
+ 
+	printf("\n %d holiday day types loaded\n\n",i);
+}
+
+
+
+void temporary_termination::db_read()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+		struct s_tt
+		{ 
+			int		account_no;
+			char	disconnect_date[9];
+		} *a; 
+		int i;
+		int rows_to_fetch, rows_before, rows_this_time;
+	EXEC SQL END DECLARE SECTION;
+
+	rows_to_fetch = CLIENT_FETCH_SIZE;		// number of rows in each "batch"  
+	rows_before = 0;						// previous value of sqlerrd[2]   
+	rows_this_time = CLIENT_FETCH_SIZE; 
+
+	if((a = new s_tt[rows_to_fetch])==NULL)
+	{
+		cout<<" cant allocate memory for disconection history fetch"<<endl;
+		exit(0);
+	}
+
+
+	EXEC SQL 
+	AT CUSTOMER_CARE  
+	DECLARE c_disconnect CURSOR FOR 
+	SELECT	CONN_ACCOUNT_NO,
+			to_char(DISCONNECTION_DATE, 'YYYYMMDD')
+	FROM	DISCONNECTION_HISTORY
+			WHERE DISCONNECTION_TYPE = 'T';
+	   
+	EXEC SQL AT CUSTOMER_CARE OPEN c_disconnect; 
+ 
+	EXEC SQL WHENEVER NOT FOUND CONTINUE; 
+
+	while (rows_this_time == rows_to_fetch) 
+	{ 
+		EXEC SQL AT CUSTOMER_CARE FOR :rows_to_fetch FETCH c_disconnect INTO :a; 		 
+
+		rows_this_time = sqlca.sqlerrd[2] - rows_before; 
+		rows_before = sqlca.sqlerrd[2]; 
+//		printf(" disconnect = %d \n", rows_before);
+
+		for(i=0; i<rows_this_time; i++)
+		{
+			insert(a[i].account_no, a[i].disconnect_date);
+		}
+	} 
+
+	EXEC SQL AT CUSTOMER_CARE CLOSE c_disconnect; 
+	delete a;
+
+	printf("\n %d loaded disconnection histories \n\n",rows_before);
+}
+
+
+void package_discount::db_read()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+		struct s_tt
+		{ 
+			char package_code[5+1];
+			char bill_item[10+1];
+			double limit;
+			double discount_percent;
+		} *a; 
+		int i;
+		char t_bill_date[20];
+		int rows_to_fetch, rows_before, rows_this_time;
+	EXEC SQL END DECLARE SECTION;
+
+	strcpy(t_bill_date,bill_date.c_str());
+
+	rows_to_fetch = CLIENT_FETCH_SIZE;		// number of rows in each "batch"  
+	rows_before = 0;						// previous value of sqlerrd[2]   
+	rows_this_time = CLIENT_FETCH_SIZE; 
+
+	if((a = new s_tt[rows_to_fetch])==NULL)
+	{
+		cout<<" cant allocate memory for package discount fetch"<<endl;
+		exit(0);
+	}
+
+
+	EXEC SQL 
+	AT CUSTOMER_CARE  
+	DECLARE c_pkg_discount CURSOR FOR 
+	SELECT	package_code,
+			bill_item,
+			limit,
+			discount_percent
+	FROM	bill_fast_discount_packages_v
+			WHERE start_date <= :t_bill_date and end_date >= :t_bill_date;
+ 
+ 	EXEC SQL AT CUSTOMER_CARE OPEN c_pkg_discount; 
+ 
+	EXEC SQL WHENEVER NOT FOUND CONTINUE; 
+
+	pkg_discount_key k;
+	pkg_discount_data d;
+
+	while (rows_this_time == rows_to_fetch) 
+	{ 
+		EXEC SQL AT CUSTOMER_CARE FOR :rows_to_fetch FETCH c_pkg_discount INTO :a; 		 
+
+		rows_this_time = sqlca.sqlerrd[2] - rows_before; 
+		rows_before = sqlca.sqlerrd[2]; 
+
+		for(i=0; i<rows_this_time; i++)
+		{
+			k.bill_item = a[i].bill_item;
+			k.limit = a[i].limit;
+			k.package_code = a[i].package_code;
+			d.discount_percent = a[i].discount_percent;
+			insert(k, d);
+		}
+	} 
+
+	EXEC SQL AT CUSTOMER_CARE CLOSE c_pkg_discount; 
+	delete a;
+
+	// make the index for fast discount look up
+	make_short_index();
+
+	printf("\n %d loaded package discounts \n\n",rows_before);
+}
+
+
+
+void other_charges::db_read()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+		struct s_o_c
+		{ 
+			int account_no;
+			char item_code[10+1];
+			double amount;
+			double operator_fee;
+			char  taxable_op_fee[1+1];
+		} *a; 
+		int i;
+		char t_start_date[20], t_end_date[20];
+		int rows_to_fetch, rows_before, rows_this_time;
+	EXEC SQL END DECLARE SECTION;
+
+	strcpy(t_start_date, start_date.c_str());
+	strcpy(t_end_date, end_date.c_str());
+
+	rows_to_fetch = CLIENT_FETCH_SIZE;		// number of rows in each "batch"  
+	rows_before = 0;						// previous value of sqlerrd[2]   
+	rows_this_time = CLIENT_FETCH_SIZE; 
+
+	if((a = new s_o_c[rows_to_fetch])==NULL)
+	{
+		cout<<" cant allocate memory for other charges fetch"<<endl;
+		exit(0);
+	}
+
+	EXEC SQL 
+	AT CUSTOMER_CARE  
+	DECLARE c_oth_charges CURSOR FOR 
+	SELECT	account_no,
+			item_code,
+			amount,
+			operator_fee,
+			taxable_op_fee	
+	FROM	bill_fast_other_charge_v
+			WHERE payment_date between :t_start_date AND :t_end_date;
+	   
+	EXEC SQL AT CUSTOMER_CARE OPEN c_oth_charges; 
+ 
+	EXEC SQL WHENEVER NOT FOUND CONTINUE; 
+
+	oth_chg_data d;
+
+	while (rows_this_time == rows_to_fetch) 
+	{ 
+		EXEC SQL AT CUSTOMER_CARE FOR :rows_to_fetch FETCH c_oth_charges INTO :a; 		 
+
+		rows_this_time = sqlca.sqlerrd[2] - rows_before; 
+		rows_before = sqlca.sqlerrd[2]; 
+
+		for(i=0; i<rows_this_time; i++)
+		{
+			d.bill_item = a[i].item_code;
+			d.amount = a[i].amount;
+			d.operator_fee = a[i].operator_fee;
+			d.taxable = (strcmp(a[i].taxable_op_fee,"Y")==0) ? true:false;
+			insert(a[i].account_no, d);
+		}
+	} 
+
+	EXEC SQL AT CUSTOMER_CARE CLOSE c_oth_charges; 
+	delete a;
+
+	printf("\n %d other charges loaded \n\n",rows_before);
+}
+
+   
+void holiday_groups::db_read()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	struct time_band 
+	{ 
+		char	group_id[BUF_LEN]; 
+		char	day_id[BUF_LEN];
+	} a, *hpp; 
+	int i;
+	EXEC SQL END DECLARE SECTION;
+
+	hpp = &a;
+
+    EXEC SQL AT CUSTOMER_CARE DECLARE c_holiday_group CURSOR FOR 
+        SELECT GROUP_ID, DAY_ID
+            FROM r_d_holiday_group_days; 
+       
+    EXEC SQL AT CUSTOMER_CARE OPEN c_holiday_group; 
+ 
+    EXEC SQL WHENEVER NOT FOUND DO break; 
+
+
+    for (i=0; ;i++) 
+    { 
+        EXEC SQL AT CUSTOMER_CARE FETCH c_holiday_group INTO :hpp; 
+
+		holiday_group_data k;
+
+		k.day_id = hpp->day_id;
+		k.group  = hpp->group_id;
+		insert(k);
+    } 
+
+    EXEC SQL AT CUSTOMER_CARE CLOSE c_holiday_group; 
+ 
+    printf("\n %d holiday groups loaded.\n\n",i);
+}
+
+
+
+void taxes::db_read()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	struct tax_s 
+	{ 
+		 char tax_type[BUF_LEN];	//	VARCHAR2(5)
+		 float rate;				//	NUMBER(5,2)
+		 float slab;				//	NUMBER(14,2)
+		 char tax_group[BUF_LEN];	//  VARCHAR2(5)
+		 int priority;				//  NUMBER(2)
+	} a, *tp; 
+	EXEC SQL END DECLARE SECTION;
+
+	int i;
+	tp = &a;
+ 
+    EXEC SQL AT CUSTOMER_CARE DECLARE c_tax CURSOR FOR 
+	SELECT	NVL(TAX_TYPE,'*'), NVL(RATE,0), 
+			NVL(SLAB,0),  TAX_GROUP,  PRIORITY
+	FROM	R_TAX_DEFS_V;
+       
+    EXEC SQL AT CUSTOMER_CARE OPEN c_tax; 
+ 
+    EXEC SQL WHENEVER NOT FOUND DO break; 
+
+    for (i=0; ;i++) 
+    { 
+        EXEC SQL AT CUSTOMER_CARE FETCH c_tax INTO :tp; 
+
+		tax_key tk;
+		tk.type = tp->tax_type;
+		tk.slab = tp->slab;
+		tk.group = tp->tax_group;
+		tk.priority = tp->priority;
+
+		insert(tk, tp->rate);
+    } 
+
+    EXEC SQL AT CUSTOMER_CARE CLOSE c_tax; 
+ 
+    printf("\n %d  tax definitions loaded.\n\n",i);
+}
+
+
+void connections::db_insert_bill_block(int bills_pending_insert, bill_block *b)
+{
+
+EXEC SQL BEGIN DECLARE SECTION;
+struct bill
+{
+	char  b_client_code[50];	// varchar2(8)		not null,
+ 	int   b_account_no;			// number(10)		not null,
+	char  b_bill_no[50];		// varchar2(10)		not null,
+	char  b_due_date[50];		// date 			not null,
+	char  b_bill_date[50];		// date				null,    	-- if null the bill is open.
+	char  b_start_date[50];		// date 			not null,
+	char  b_end_date[50];		// date				not null,
+	float b_balance_bf;			// number(14,2)		not null,
+	float b_total_bill_value;	// number(14,2)		not null,
+	float b_balance_cf;			// number(14,2)		not null -- for next bill (bf-payments+bill_amount)
+	char  b_br_code[50];		// varchar2(2)		not null,
+	float b_bill_payments;		// number(14,2)		not null,
+	int	  b_run_no;				// number(5)
+	char  b_printed[2];			// varchar2(1)
+	char  b_corporate_bill_code[50];
+	int	  b_random_no;
+} *a;
+int rows_to_insert;
+EXEC SQL END DECLARE SECTION;
+
+	rows_to_insert = bills_pending_insert;
+
+	if((a = new bill[BILL_BLOCK_SIZE])==NULL)
+	{
+		cout<<" cant allocate memory for bill insert"<<endl;
+		exit(0);
+	}
+
+
+	for(int i=0; i<bills_pending_insert; i++)
+	{
+		strcpy(a[i].b_client_code, b[i].client_code);
+		a[i].b_account_no = b[i].account_no;
+	
+		strcpy(a[i].b_bill_no, b[i].bill_no);
+		strcpy(a[i].b_br_code,gsm_bill_cycle->bill_cycle_code.c_str());
+		a[i].b_total_bill_value = b[i].total_bill_value;
+		strcpy(a[i].b_start_date, start_date.c_str());
+		strcpy(a[i].b_end_date, end_date.c_str());
+		strcpy(a[i].b_due_date, due_date.c_str());
+		strcpy(a[i].b_bill_date, bill_date.c_str());
+		a[i].b_balance_bf = b[i].balance_bf;
+		a[i].b_balance_cf = b[i].balance_cf;
+		a[i].b_bill_payments = b[i].bill_payments;
+		a[i].b_run_no = gsm_bill_cycle->run_no;
+		strcpy(a[i].b_printed,"N");
+		strcpy(a[i].b_corporate_bill_code,b[i].corporate_bill_code);
+		a[i].b_random_no = 0; //-- rand()/(int)(((unsigned)RAND_MAX + 1) / 10E6);
+		
+
+		/*
+		cout
+		<<" bill no		="<<a[i].b_bill_no<<endl
+		<<" client_code	="<<a[i].b_client_code<<endl
+		<<" account_no	="<<a[i].b_account_no<<endl
+		<<" br_code		="<<a[i].b_br_code<<endl
+		<<" bill_value	="<<a[i].b_total_bill_value<<endl
+		<<" start_date	="<<a[i].b_start_date<<endl
+		<<" end_date	="<<a[i].b_end_date<<endl
+		<<" due_date	="<<a[i].b_due_date<<endl
+		<<" bill_date	="<<a[i].b_bill_date<<endl
+		<<" balance_bf	="<<a[i].b_balance_bf<<endl
+		<<" balance cf	="<<a[i].b_balance_cf<<endl
+		<<" payments	="<<a[i].b_bill_payments<<endl
+		<<" corp_code	="<<a[i].b_corporate_bill_code<<endl;
+		*/		
+
+
+	}
+
+	for(int j=0; j<1; j++) // precomplier bug ?
+	{
+		EXEC SQL 
+		AT CUSTOMER_CARE  
+//	FOR :rows_to_insert INSERT INTO BILL_MASTER_RAW VALUES (:a);
+//--INTERIM
+		FOR :rows_to_insert INSERT INTO BILL_MASTER_I VALUES (:a);
+	}
+
+
+	EXEC SQL AT CUSTOMER_CARE COMMIT; 
+
+	delete a;
+}
+
+
+void connections::db_insert_bill_items_block(int bill_items_pending_insert, bill_item_block *b)
+{
+EXEC SQL BEGIN DECLARE SECTION;
+struct bill_item{
+  char	b_BILL_NO[20];			//	NUMBER(10)
+  char	b_ITEM_CODE[20];		//	VARCHAR2(10)
+  float	b_VALUE;				//	NUMBER(12,2)
+  } *a;
+  int rows_to_insert;
+EXEC SQL END DECLARE SECTION;
+
+	// initalise account number & invoice number common for all items in bill summary
+	rows_to_insert = bill_items_pending_insert;
+	if((a = new bill_item[BILL_BLOCK_SIZE*50])==NULL)
+	{
+		cout<<" cant allocate memory for bill block"<<endl;
+		exit(0);
+	}
+
+	for(int i=0; i<bill_items_pending_insert; i++)
+	{
+		strcpy(a[i].b_BILL_NO, b[i].bill_no);
+		strcpy(a[i].b_ITEM_CODE, b[i].item_code);
+		a[i].b_VALUE=b[i].value;
+		//cout<<i<<" bill no = "<<a[i].b_BILL_NO<<" code = "<<a[i].b_ITEM_CODE<<" val = "<<a[i].b_VALUE<<endl;
+	}
+
+
+	for(int j=0; j<1; j++)	// precomplier bug ?
+	{
+		EXEC SQL 
+		AT CUSTOMER_CARE 
+//--INTERIM
+	FOR :rows_to_insert INSERT INTO BILL_SUMMARY_ITEMS_I VALUES (:a);
+//	FOR :rows_to_insert INSERT INTO BILL_SUMMARY_ITEMS_RAW VALUES (:a);
+	}
+
+	EXEC SQL AT CUSTOMER_CARE COMMIT; // remove when debug is done TODO
+	delete a;
+}
+
+ 
+void connections::db_read_interim_bill_date()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+		char b_date[BUF_LEN];
+	EXEC SQL END DECLARE SECTION;
+
+    EXEC SQL WHENEVER NOT FOUND GOTO notfound_bill_date;
+
+	EXEC SQL
+	AT CUSTOMER_CARE 
+	SELECT to_char(sysdate,'YYYYMMDD')
+    INTO :b_date
+    FROM DUAL;
+
+	bill_date = b_date; 
+    printf("\n bill date = %s \n\n",b_date);
+	return;
+
+notfound_bill_date:
+	printf("\n bill date not found");
+	exit(0);
+
+}
+
+
+void connections::db_truncate_tables()
+{
+/*
+	cout<<" Updating Anyware "<<endl;
+	EXEC SQL
+	AT CUSTOMER_CARE 
+	insert into sms_charges (select * from sms_charges_v 
+	where delivered_time > (select max(delivered_time) from sms_charges));
+*/
+
+
+	cout<<" Dropping summary index "<<endl;
+	EXEC SQL
+	AT CUSTOMER_CARE 
+	DROP INDEX BILL_NO_INDX_I;
+
+	cout<<" Dropping bill master index "<<endl;
+	EXEC SQL
+	AT CUSTOMER_CARE 
+	drop index INDX_BILL_MASTER_I;
+
+	cout<<" Tuncating bill master interim"<<endl;
+	EXEC SQL
+	AT CUSTOMER_CARE 
+	TRUNCATE TABLE BILL_MASTER_I;
+
+	cout<<" Tuncating bill summary items interim"<<endl;
+	EXEC SQL
+	AT CUSTOMER_CARE 
+	TRUNCATE TABLE BILL_SUMMARY_ITEMS_I;
+
+	return;
+}
+
+
+void connections::db_create_indexes()
+{
+	cout<< " Creating index on BILL_MASTER_I "<<endl;
+	EXEC SQL
+	AT CUSTOMER_CARE 
+	CREATE INDEX "INDX_BILL_MASTER_I" 
+	ON "BILL_MASTER_I"("ACCOUNT_NO") 
+	TABLESPACE "INDX" 
+	STORAGE ( INITIAL 10M NEXT 10M) NOLOGGING;
+
+	cout<<" Creating index  on BILL_SUMMARY_ITEMS_I "<<endl;
+	EXEC SQL
+	AT CUSTOMER_CARE 
+	CREATE INDEX "BILL_NO_INDX_I" 
+	ON "BILL_SUMMARY_ITEMS_I"("BILL_NO") 
+	TABLESPACE "INDX" 
+	STORAGE ( INITIAL 10M NEXT 10M) NOLOGGING;
+}
+
+
+
+
+
+
+
+
+
+
+
